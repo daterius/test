@@ -1,5 +1,7 @@
 name: RDP via Tailscale
-on: { workflow_dispatch: {} }
+
+on:
+  workflow_dispatch:
 
 jobs:
   secure-rdp:
@@ -14,13 +16,12 @@ jobs:
 
           # Включаем RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0 -Force
-          # Оставим NLA включённым (безопаснее)
+          # Включаем NLA (более безопасно)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name SecurityLayer -Value 1 -Force
 
-          # Удалить старое правило (если есть) — без bash '||'
+          # Открываем порт 3389
           cmd /c 'netsh advfirewall firewall delete rule name="RDP-Tailscale"' | Out-Null
-          # Добавить правило для 3389
           cmd /c 'netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389' | Out-Null
 
           Restart-Service -Name TermService -Force
@@ -56,10 +57,10 @@ jobs:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           $ErrorActionPreference = "Stop"
-          $host = "gh-runner-$env:GITHUB_RUN_ID"
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey "$env:TAILSCALE_AUTH_KEY" --hostname $host
+          $tsName = "gh-runner-$env:GITHUB_RUN_ID"
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey "$env:TAILSCALE_AUTH_KEY" --hostname $tsName
 
-          # Ждём IPv4
+          # Ждём IP
           $ip = $null
           1..20 | ForEach-Object {
             $ip = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4) | Select-Object -First 1
