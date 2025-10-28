@@ -1,124 +1,84 @@
 name: RDP via Tailscale
-
-on:
-  workflow_dispatch:
+on: { workflow_dispatch: {} }
 
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    # Рекомендуемый предел — 360 минут (6 часов). Поставь нужное значение.
     timeout-minutes: 360
 
     steps:
-      - name: Configure Core RDP Settings
+      - name: Enable RDP + Firewall
         shell: powershell
         run: |
-          # Включаем Remote Desktop
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" -Value 0 -Force
+          $ErrorActionPreference = "Stop"
 
-          # Опция: отключаем NLA (UserAuthentication). Лучше оставить 1 если можно.
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" -Value 0 -Force
+          # Включаем RDP
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0 -Force
+          # Оставим NLA включённым (безопаснее)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name SecurityLayer -Value 1 -Force
 
-          # SecurityLayer 0 — позволяет небезопасные соединения (RDP w/o TLS). Опция — изменить на 1/2 при желании.
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "SecurityLayer" -Value 0 -Force
+          # Удалить старое правило (если есть) — без bash '||'
+          cmd /c 'netsh advfirewall firewall delete rule name="RDP-Tailscale"' | Out-Null
+          # Добавить правило для 3389
+          cmd /c 'netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389' | Out-Null
 
-          # Фаервол: добавим правило
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "No existing rule"
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
-
-          # Перезапустим сервис, чтобы изменения вступили в силу
           Restart-Service -Name TermService -Force
 
-      - name: Create RDP User with Secure Password
+      - name: Create RDP user with random password
         shell: powershell
         run: |
-          # Генерация сложного пароля
-          $rand = -join (
-            (65..90 | Get-Random -Count 4 | ForEach-Object {[char]$_}) +
-            (97..122 | Get-Random -Count 4 | ForEach-Object {[char]$_}) +
-            (48..57 | Get-Random -Count 4 | ForEach-Object {[char]$_}) +
-            ((33..47 + 58..64 + 91..96 + 123..126) | Get-Random -Count 4 | ForEach-Object {[char]$_})
-          ) | ForEach-Object -Begin {$_} -Process {$_} 
-          $password = ($rand.ToCharArray() | Get-Random -Count $rand.Length) -join ''
+          $chars = (65..90 + 97..122 + 48..57 + 33..47 + 58..64 + 91..96 + 123..126) | ForEach-Object {[char]$_}
+          $password = -join (1..20 | ForEach-Object { $chars | Get-Random })
 
-          # Создаём пользователя (если уже есть — обновим пароль)
-          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
-            $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-            Set-LocalUser -Name "RDP" -Password $securePass
+          if (Get-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name 'RDP' -Password (ConvertTo-SecureString $password -AsPlainText -Force)
           } else {
-            $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-            New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+            New-LocalUser -Name 'RDP' -Password (ConvertTo-SecureString $password -AsPlainText -Force) -AccountNeverExpires -PasswordNeverExpires
           }
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member 'RDP' -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group 'Administrators' -Member 'RDP' -ErrorAction SilentlyContinue
 
-          # Добавляем в группы
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
-
-          # Сохраняем в GITHUB_ENV чтобы другие шаги могли взять
-          Write-Output ("RDP_USERNAME=RDP") >> $env:GITHUB_ENV
-          Write-Output ("RDP_PASSWORD=" + $password) >> $env:GITHUB_ENV
+          "RDP_USERNAME=RDP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Install Tailscale
         shell: powershell
         run: |
-          # Скачиваем текущую версию Tailscale MSI (можно заменить ссылку при необходимости)
-          $installer = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile $installer
-          Start-Process -FilePath msiexec.exe -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installer -Force
+          $msi = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile $msi
+          Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait
+          Remove-Item $msi -Force
 
-      - name: Establish Tailscale Connection
+      - name: Bring up Tailscale
         shell: powershell
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          # Поднимаем tailscale (hostname делаем уникальным)
+          $ErrorActionPreference = "Stop"
           $host = "gh-runner-$env:GITHUB_RUN_ID"
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey="$env:TAILSCALE_AUTH_KEY" --hostname=$host
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey "$env:TAILSCALE_AUTH_KEY" --hostname $host
 
-          # Ждём появления IP
-          $tsIP = $null
-          $tries = 0
-          while (-not $tsIP -and $tries -lt 20) {
-            Start-Sleep -Seconds 3
-            $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4) -join " "
-            $tries++
+          # Ждём IPv4
+          $ip = $null
+          1..20 | ForEach-Object {
+            $ip = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4) | Select-Object -First 1
+            if ($ip) { return }
+            Start-Sleep 3
           }
+          if (-not $ip) { throw "No Tailscale IPv4 assigned." }
+          "TAILSCALE_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-          if (-not $tsIP) {
-            Write-Error "Tailscale IP не получен"
-            exit 1
-          }
-
-          Write-Output ("TAILSCALE_IP=" + $tsIP) >> $env:GITHUB_ENV
-
-      - name: Verify RDP Accessibility
+      - name: Show connection info
         shell: powershell
         run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          # Тестируем порт 3389
-          $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet
-          if (-not $test) {
-            Write-Error "TCP порт 3389 недоступен на $env:TAILSCALE_IP"
-            exit 1
-          }
-          Write-Host "TCP 3389 доступен."
-
-      - name: Show Connection Info and Keep Alive
-        shell: powershell
-        run: |
-          Write-Host ""
-          Write-Host "=== RDP ACCESS INFO ==="
+          Write-Host "=== RDP ACCESS ==="
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           Write-Host "Username: $env:RDP_USERNAME"
           Write-Host "Password: $env:RDP_PASSWORD"
-          Write-Host "======================="
-          # поддерживаем job живым
-          while ($true) {
-            Write-Host ("[" + (Get-Date).ToString() + "] Runner alive")
-            Start-Sleep -Seconds 60
-          }
+          Write-Host "=================="
+
+      - name: Keep alive
+        shell: powershell
+        run: |
+          while ($true) { Write-Host "$(Get-Date) alive"; Start-Sleep 60 }
